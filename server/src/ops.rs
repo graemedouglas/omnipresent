@@ -186,8 +186,8 @@ pub async fn ls(app: &App) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<20} {:>5}  {:<7} {:<10} {:<12} {}",
-        "NAME", "PORT", "OS", "CONNECTED", "LAST SEEN", "ID"
+        "{:<20} {:>5}  {:<7} {:<10} {:<12} ID",
+        "NAME", "PORT", "OS", "CONNECTED", "LAST SEEN"
     );
     for m in machines {
         let connected = if port_connected(m.port).await { "yes" } else { "no" };
