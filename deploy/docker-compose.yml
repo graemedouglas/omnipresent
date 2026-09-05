@@ -1,52 +1,61 @@
-# VPS layout as code — the answer to "how do I rebuild the VPS" in eighteen
-# months. Everything omni assumes present at startup is defined here.
+# omni proxy stack — rathole (tunnel server) + Termix (browser terminal)
+# + guacd (Termix's remote-desktop daemon) + omni (enrollment service).
+# Reference stack, verified on a real deployment (Sept 2026).
 #
-# Host networking on purpose: rathole binds forwarded machine ports on
-# 127.0.0.1:2201+ and Termix must reach them as loopback on the same box.
-# With bridged networks the containers wouldn't share a loopback and every
-# machine port would need publishing by hand.
+# Host networking everywhere, on purpose: rathole binds each enrolled
+# machine's forwarded port on 127.0.0.1:2201+, and Termix must reach those
+# as loopback in the same network namespace. omni reaches Termix at
+# 127.0.0.1:8090, and your reverse proxy reaches omni at 127.0.0.1:8070.
 #
-# Firewall (host): allow 2333/tcp (rathole control) and 22/tcp (key-only
-# admin). Everything else closed — Termix stays loopback and is fronted by
-# cloudflared or a reverse proxy of your choosing; omni listens on loopback
-# and gets its own tunnel or proxy vhost.
+# Ports this stack owns: 2333 (rathole control, public via router
+# forward), 8070 (omni, loopback, behind Caddy), 8090 (Termix, behind
+# Caddy), 4822 (guacd, loopback use only), 2201+ (forwarded machines).
 
 services:
   rathole:
-    # Pinned to match omni's rathole.version so server and fleet agree on a
-    # config format. Bump both together.
+    # Pinned to match omni's rathole.version — bump both together.
     image: rapiz1/rathole:v0.5.0
-    command: --server /etc/rathole/server.toml
-    network_mode: host
+    container_name: omni_rathole
     restart: unless-stopped
+    network_mode: host
+    command: --server /etc/rathole/server.toml
     volumes:
-      # omni owns and rewrites this file (the real file, not a symlink —
-      # rathole's config watcher hot-reloads it on change).
-      - /etc/rathole:/etc/rathole:ro
+      - ./rathole:/etc/rathole:ro
 
+  omni:
+    build:
+      context: ./src
+      dockerfile: server/Dockerfile
+    container_name: omni_server
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./omni/omni.toml:/etc/omni/omni.toml:ro
+      - ./omni/data:/var/lib/omni
+      # omni owns server.toml; rathole hot-reloads it on change.
+      - ./rathole:/etc/rathole
   termix:
     image: ghcr.io/lukegus/termix:latest
-    network_mode: host
+    container_name: omni_termix
     restart: unless-stopped
+    network_mode: host
     environment:
-      # Keep Termix off the public interface; check the image docs for the
-      # exact listen-address / port variables of your Termix version.
-      - PORT=8090
+      PORT: "8090"
+      GUACD_HOST: "127.0.0.1"
+      GUACD_TUNNEL_HOST: "127.0.0.1"
+      GUACD_RECORDING_PATH: "/termix-data/session_recordings/guacamole"
     volumes:
-      # Back this up. It holds every host and credential — together with
-      # omni's SQLite DB it is the fleet.
-      - termix-data:/app/data
+      - ./termix-data:/app/data
+    depends_on:
+      - guacd
 
-  # Optional: Cloudflare tunnel fronting Termix, Access in front of that.
-  # Buys no inbound web port and a second gate ahead of Termix's own login.
-  # Add or remove freely; nothing else depends on it.
-  # cloudflared:
-  #   image: cloudflare/cloudflared:latest
-  #   command: tunnel run
-  #   network_mode: host
-  #   restart: unless-stopped
-  #   environment:
-  #     - TUNNEL_TOKEN=${CLOUDFLARED_TOKEN}
-
-volumes:
-  termix-data:
+  guacd:
+    image: guacamole/guacd:1.6.0
+    container_name: omni_guacd
+    restart: unless-stopped
+    network_mode: host
+    # Only Termix (same host) talks to guacd — keep it off the LAN. The
+    # image's entrypoint appends these after its own `-b 0.0.0.0`; last wins.
+    command: ["-b", "127.0.0.1"]
+    volumes:
+      - ./termix-data:/termix-data
