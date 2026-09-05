@@ -2,11 +2,17 @@
 # omni (agent-side) — enrollment installer and client command in one file.
 #
 # First run (piped from the server):
-#   curl -fsSL https://omni.tld/install.sh | sudo sh -s -- <token> [--with-herdr] [--name x]
+#   curl -fsSL https://omni.tld/install.sh | sudo sh -s -- <token> [--with-herdr] [--name x] [--label x]
 #
 # The installer's last act is to write a persistent copy of itself to
 # /usr/local/bin/omni. After that, everything is `omni <verb>` on the box:
 #   omni status | restart | update | logs | uninstall
+#
+# A machine can enroll with several proxies (independent omni stacks): each
+# enrollment lives under /etc/omni/proxies/<label>/ with its own client.toml
+# and its own rathole process, because a rathole client dials exactly one
+# remote_addr. Verbs act on every proxy unless given a label. The proxies
+# never coordinate; each is a self-contained recovery path.
 #
 # POSIX sh. Must run on macOS bash 3.2 and dash. No jq, no GNU-only sed,
 # no associative arrays, no mapfile, no ${var,,}.
@@ -18,16 +24,15 @@ RATHOLE_VERSION="__RATHOLE_VERSION__"
 HERDR_INSTALL_URL="__HERDR_INSTALL_URL__"
 
 ETC_DIR=/etc/omni
-STATE_FILE=$ETC_DIR/machine
-CLIENT_TOML=$ETC_DIR/client.toml
+PROXIES_DIR=$ETC_DIR/proxies
 BIN_DIR=/usr/local/bin
 RATHOLE_BIN=$BIN_DIR/rathole
 SELF_BIN=$BIN_DIR/omni
-SERVICE=omni-rathole
+SERVICE_PREFIX=omni-rathole
 HB_SERVICE=omni-heartbeat
-MAC_RATHOLE_PLIST=/Library/LaunchDaemons/com.omni.rathole.plist
-MAC_HB_PLIST=/Library/LaunchDaemons/com.omni.heartbeat.plist
-MAC_LOG=/var/log/omni-rathole.log
+SYSTEMD_DIR=/etc/systemd/system
+MAC_PLIST_DIR=/Library/LaunchDaemons
+MAC_HB_PLIST=$MAC_PLIST_DIR/com.omni.heartbeat.plist
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'omni: %s\n' "$*" >&2; exit 1; }
@@ -56,14 +61,51 @@ need_baked_url() {
     esac
 }
 
+# ---------------------------------------------------------------- proxies ----
+
+# Filesystem-, systemd-instance-, and launchd-label-safe name derived from
+# the proxy URL host (override with --label at enroll).
+label_from_url() {
+    hostport=${1#*://}
+    hostport=${hostport%%/*}
+    printf '%s' "$hostport" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '-'
+}
+
+all_labels() {
+    [ -d "$PROXIES_DIR" ] || return 0
+    for d in "$PROXIES_DIR"/*/; do
+        [ -f "$d/machine" ] || continue
+        basename "$d"
+    done
+}
+
+proxy_count() { all_labels | wc -l | tr -d ' '; }
+
+# Sets m_id, m_secret, m_port, m_name, m_url, m_label; points OMNI_URL at
+# this proxy.
 load_state() {
-    [ -f "$STATE_FILE" ] || die "not enrolled (no $STATE_FILE) — enroll first with a token"
+    state="$PROXIES_DIR/$1/machine"
+    [ -f "$state" ] || die "no proxy '$1' (have: $(all_labels | tr '\n' ' '))"
     # Shell-sourceable key='value' file written by ourselves at enroll time.
-    . "$STATE_FILE"
-    [ -n "${m_id:-}" ] && [ -n "${m_secret:-}" ] || die "$STATE_FILE is corrupt — re-enroll"
-    # Prefer the URL recorded at enroll over whatever is baked into this copy.
+    . "$state"
+    [ -n "${m_id:-}" ] && [ -n "${m_secret:-}" ] || die "$state is corrupt — re-enroll this proxy"
     OMNI_URL=${m_url:-$OMNI_URL}
 }
+
+# Verbs take an optional label: none means every proxy.
+resolve_labels() {
+    if [ -n "${1:-}" ]; then
+        [ -f "$PROXIES_DIR/$1/machine" ] || die "no proxy '$1' (have: $(all_labels | tr '\n' ' '))"
+        echo "$1"
+        return 0
+    fi
+    labels=$(all_labels)
+    [ -n "$labels" ] || die "not enrolled with any proxy — enroll first with a token"
+    echo "$labels"
+}
+
+mac_plist() { echo "$MAC_PLIST_DIR/com.omni.rathole.$1.plist"; }
+mac_log() { echo "/var/log/omni-rathole.$1.log"; }
 
 # ---------------------------------------------------------------- rathole ----
 
@@ -89,6 +131,8 @@ rathole_installed_version() {
     "$RATHOLE_BIN" --version 2>/dev/null | awk '/Build Version:/{print $3; exit}'
 }
 
+# One shared binary serves every proxy's tunnel; when proxies pin different
+# versions, `omni update` warns and the last-updated pin wins.
 install_rathole() {
     current=$(rathole_installed_version) || current=""
     if [ "$current" = "$RATHOLE_VERSION" ]; then
@@ -141,30 +185,31 @@ check_sshd() {
 
 # --------------------------------------------------------------- services ----
 
-write_services_linux() {
-    cat > "/etc/systemd/system/$SERVICE.service" <<EOF
+# The template and heartbeat units are shared; each proxy is an instance.
+write_shared_units_linux() {
+    cat > "$SYSTEMD_DIR/$SERVICE_PREFIX@.service" <<EOF
 [Unit]
-Description=omni rathole tunnel
+Description=omni rathole tunnel (%i)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=$RATHOLE_BIN $CLIENT_TOML
+ExecStart=$RATHOLE_BIN $PROXIES_DIR/%i/client.toml
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    cat > "/etc/systemd/system/$HB_SERVICE.service" <<EOF
+    cat > "$SYSTEMD_DIR/$HB_SERVICE.service" <<EOF
 [Unit]
-Description=omni heartbeat
+Description=omni heartbeat (all proxies)
 
 [Service]
 Type=oneshot
 ExecStart=$SELF_BIN heartbeat
 EOF
-    cat > "/etc/systemd/system/$HB_SERVICE.timer" <<EOF
+    cat > "$SYSTEMD_DIR/$HB_SERVICE.timer" <<EOF
 [Unit]
 Description=omni heartbeat every 5 minutes
 
@@ -176,24 +221,29 @@ OnUnitActiveSec=5min
 WantedBy=timers.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now "$SERVICE.service" >/dev/null 2>&1 || systemctl restart "$SERVICE.service"
     systemctl enable --now "$HB_SERVICE.timer" >/dev/null 2>&1 || true
 }
 
+enable_service_linux() {
+    systemctl enable --now "$SERVICE_PREFIX@$1.service" >/dev/null 2>&1 \
+        || systemctl restart "$SERVICE_PREFIX@$1.service"
+}
+
 write_services_darwin() {
-    cat > "$MAC_RATHOLE_PLIST" <<EOF
+    plist=$(mac_plist "$1")
+    cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-    <key>Label</key><string>com.omni.rathole</string>
+    <key>Label</key><string>com.omni.rathole.$1</string>
     <key>ProgramArguments</key><array>
         <string>$RATHOLE_BIN</string>
-        <string>$CLIENT_TOML</string>
+        <string>$PROXIES_DIR/$1/client.toml</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>$MAC_LOG</string>
-    <key>StandardErrorPath</key><string>$MAC_LOG</string>
+    <key>StandardOutPath</key><string>$(mac_log "$1")</string>
+    <key>StandardErrorPath</key><string>$(mac_log "$1")</string>
 </dict></plist>
 EOF
     cat > "$MAC_HB_PLIST" <<EOF
@@ -208,28 +258,40 @@ EOF
     <key>StartInterval</key><integer>300</integer>
 </dict></plist>
 EOF
-    chown root:wheel "$MAC_RATHOLE_PLIST" "$MAC_HB_PLIST"
-    chmod 0644 "$MAC_RATHOLE_PLIST" "$MAC_HB_PLIST"
-    launchctl bootout system/com.omni.rathole 2>/dev/null || true
-    launchctl bootstrap system "$MAC_RATHOLE_PLIST" 2>/dev/null || launchctl load -w "$MAC_RATHOLE_PLIST"
+    chown root:wheel "$plist" "$MAC_HB_PLIST"
+    chmod 0644 "$plist" "$MAC_HB_PLIST"
+    launchctl bootout "system/com.omni.rathole.$1" 2>/dev/null || true
+    launchctl bootstrap system "$plist" 2>/dev/null || launchctl load -w "$plist"
     launchctl bootout system/com.omni.heartbeat 2>/dev/null || true
     launchctl bootstrap system "$MAC_HB_PLIST" 2>/dev/null || launchctl load -w "$MAC_HB_PLIST"
 }
 
 service_restart() {
     case "$(os_type)" in
-        linux) systemctl restart "$SERVICE.service" ;;
-        darwin) launchctl kickstart -k system/com.omni.rathole 2>/dev/null || {
-                    launchctl unload "$MAC_RATHOLE_PLIST" 2>/dev/null || true
-                    launchctl load -w "$MAC_RATHOLE_PLIST"
+        linux) systemctl restart "$SERVICE_PREFIX@$1.service" ;;
+        darwin) launchctl kickstart -k "system/com.omni.rathole.$1" 2>/dev/null || {
+                    launchctl unload "$(mac_plist "$1")" 2>/dev/null || true
+                    launchctl load -w "$(mac_plist "$1")"
                 } ;;
     esac
 }
 
 service_active() {
     case "$(os_type)" in
-        linux) systemctl is-active --quiet "$SERVICE.service" ;;
-        darwin) launchctl print system/com.omni.rathole >/dev/null 2>&1 ;;
+        linux) systemctl is-active --quiet "$SERVICE_PREFIX@$1.service" ;;
+        darwin) launchctl print "system/com.omni.rathole.$1" >/dev/null 2>&1 ;;
+    esac
+}
+
+service_remove() {
+    case "$(os_type)" in
+        linux)
+            systemctl disable --now "$SERVICE_PREFIX@$1.service" 2>/dev/null || true
+            ;;
+        darwin)
+            launchctl bootout "system/com.omni.rathole.$1" 2>/dev/null || true
+            rm -f "$(mac_plist "$1")" "$(mac_log "$1")"
+            ;;
     esac
 }
 
@@ -237,7 +299,7 @@ service_active() {
 
 install_self() {
     tmp=$(mktemp)
-    if curl -fsSL "$OMNI_URL/install.sh" -o "$tmp"; then
+    if curl -fsSL "$1/install.sh" -o "$tmp"; then
         install -m 0755 "$tmp" "$SELF_BIN"
         rm -f "$tmp"
         return 0
@@ -246,27 +308,43 @@ install_self() {
     return 1
 }
 
+write_state() {
+    # $1 label — remaining values from m_* globals
+    umask 077
+    cat > "$PROXIES_DIR/$1/machine" <<EOF
+m_id='$m_id'
+m_secret='$m_secret'
+m_port='$m_port'
+m_name='${m_name:-}'
+m_url='$OMNI_URL'
+m_label='$1'
+EOF
+}
+
 do_enroll() {
     need_baked_url
     need_root enroll "$@"
     token=""
     with_herdr=0
     name=$(uname -n)
+    label=$(label_from_url "$OMNI_URL")
     while [ $# -gt 0 ]; do
         case "$1" in
             --with-herdr) with_herdr=1 ;;
             --name) shift; name=${1:-} ;;
+            --label) shift; label=$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '-') ;;
             -*) die "unknown flag: $1" ;;
             *) token=$1 ;;
         esac
         shift
     done
-    [ -n "$token" ] || die "usage: curl -fsSL $OMNI_URL/install.sh | sudo sh -s -- <token> [--with-herdr] [--name x]"
+    [ -n "$token" ] || die "usage: curl -fsSL $OMNI_URL/install.sh | sudo sh -s -- <token> [--with-herdr] [--name x] [--label x]"
+    [ -n "$label" ] || die "empty --label"
     command -v curl >/dev/null 2>&1 || die "curl is required"
     check_sshd
     install_rathole
 
-    say "enrolling with $OMNI_URL ..."
+    say "enrolling with $OMNI_URL (proxy label: $label) ..."
     resp=$(curl -fsS -X POST "$OMNI_URL/enroll" \
         --data-urlencode "token=$token" \
         --data-urlencode "name=$name" \
@@ -283,27 +361,24 @@ do_enroll() {
     m_name=$(printf '%s\n' "$resp" | sed -n 's/^name=//p')
     [ -n "$m_id" ] && [ -n "$m_secret" ] && [ -n "$m_port" ] || die "incomplete enrollment response"
 
-    mkdir -p "$ETC_DIR"
-    chmod 0700 "$ETC_DIR"
+    mkdir -p "$PROXIES_DIR/$label"
+    chmod 0700 "$ETC_DIR" "$PROXIES_DIR" "$PROXIES_DIR/$label"
     umask 077
     printf '%s\n' "$resp" \
         | awk '/^---BEGIN CLIENT TOML---$/{f=1;next} /^---END CLIENT TOML---$/{f=0} f' \
-        > "$CLIENT_TOML"
-    [ -s "$CLIENT_TOML" ] || die "server response contained no client.toml"
-    cat > "$STATE_FILE" <<EOF
-m_id='$m_id'
-m_secret='$m_secret'
-m_port='$m_port'
-m_name='$m_name'
-m_url='$OMNI_URL'
-EOF
+        > "$PROXIES_DIR/$label/client.toml"
+    [ -s "$PROXIES_DIR/$label/client.toml" ] || die "server response contained no client.toml"
+    write_state "$label"
 
     case "$(os_type)" in
-        linux) write_services_linux ;;
-        darwin) write_services_darwin ;;
+        linux)
+            write_shared_units_linux
+            enable_service_linux "$label"
+            ;;
+        darwin) write_services_darwin "$label" ;;
     esac
 
-    install_self || say "warning: could not install the omni command to $SELF_BIN"
+    install_self "$OMNI_URL" || say "warning: could not install the omni command to $SELF_BIN"
 
     if [ "$with_herdr" -eq 1 ]; then
         case "$HERDR_INSTALL_URL" in
@@ -314,120 +389,187 @@ EOF
     fi
 
     say ""
-    say "enrolled: $m_name (port $m_port on the server)"
-    say "tunnel service: $SERVICE — it should appear in Termix within seconds"
-    say "manage this machine with: omni status | restart | update | logs | uninstall"
+    say "enrolled: $m_name (port $m_port on proxy '$label')"
+    n=$(proxy_count)
+    [ "$n" -gt 1 ] && say "this machine now tunnels to $n proxies: $(all_labels | tr '\n' ' ')"
+    say "manage with: omni status | restart | update | logs | uninstall  (add a label to target one proxy)"
 }
 
 # ------------------------------------------------------------------ verbs ----
 
 do_status() {
-    load_state
-    if service_active; then
-        say "tunnel:  up ($SERVICE)"
-    else
-        say "tunnel:  DOWN ($SERVICE)"
-    fi
-    say "machine: ${m_name:-?} (${m_id})"
-    say "port:    ${m_port:-?} on the server, forwarding to 127.0.0.1:22"
-    if curl -fsS -m 5 -o /dev/null -X POST "$OMNI_URL/heartbeat" \
-        -H "X-Omni-Machine: $m_id" -H "X-Omni-Secret: $m_secret" 2>/dev/null; then
-        say "server:  reachable ($OMNI_URL)"
-    else
-        say "server:  UNREACHABLE ($OMNI_URL)"
-    fi
-    case "$(os_type)" in
-        linux) say "recent:" ; journalctl -u "$SERVICE" --no-pager -n 3 -o cat 2>/dev/null | sed 's/^/  /' || true ;;
-        darwin) say "recent:" ; tail -n 3 "$MAC_LOG" 2>/dev/null | sed 's/^/  /' || true ;;
-    esac
+    labels=$(resolve_labels "${1:-}")
+    for l in $labels; do
+        (
+            load_state "$l"
+            say "proxy: $l ($OMNI_URL)"
+            if service_active "$l"; then
+                say "  tunnel:  up ($SERVICE_PREFIX@$l)"
+            else
+                say "  tunnel:  DOWN ($SERVICE_PREFIX@$l)"
+            fi
+            say "  machine: ${m_name:-?} (${m_id})"
+            say "  port:    ${m_port:-?} on the proxy, forwarding to 127.0.0.1:22"
+            if curl -fsS -m 5 -o /dev/null -X POST "$OMNI_URL/heartbeat" \
+                -H "X-Omni-Machine: $m_id" -H "X-Omni-Secret: $m_secret" 2>/dev/null; then
+                say "  server:  reachable"
+            else
+                say "  server:  UNREACHABLE"
+            fi
+        )
+    done
 }
 
 do_restart() {
-    need_root restart
-    load_state
-    service_restart
-    say "restarted $SERVICE"
+    need_root restart "$@"
+    labels=$(resolve_labels "${1:-}")
+    for l in $labels; do
+        service_restart "$l"
+        say "restarted $SERVICE_PREFIX@$l"
+    done
 }
 
 do_logs() {
+    labels=$(resolve_labels "${1:-}")
     case "$(os_type)" in
-        linux) exec journalctl -u "$SERVICE" -f ;;
-        darwin) exec tail -f "$MAC_LOG" ;;
+        linux)
+            if [ -n "${1:-}" ]; then
+                exec journalctl -u "$SERVICE_PREFIX@$1" -f
+            fi
+            exec journalctl -u "$SERVICE_PREFIX@*" -f
+            ;;
+        darwin)
+            files=""
+            for l in $labels; do
+                files="$files $(mac_log "$l")"
+            done
+            # shellcheck disable=SC2086
+            exec tail -f $files
+            ;;
     esac
 }
 
 do_heartbeat() {
-    load_state
-    curl -fsS -m 10 -o /dev/null -X POST "$OMNI_URL/heartbeat" \
-        -H "X-Omni-Machine: $m_id" -H "X-Omni-Secret: $m_secret"
+    ok=0
+    fail=0
+    for l in $(all_labels); do
+        if (
+            load_state "$l"
+            curl -fsS -m 10 -o /dev/null -X POST "$OMNI_URL/heartbeat" \
+                -H "X-Omni-Machine: $m_id" -H "X-Omni-Secret: $m_secret"
+        ) 2>/dev/null; then
+            ok=$((ok + 1))
+        else
+            fail=$((fail + 1))
+        fi
+    done
+    # One proxy being down is the redundancy scenario, not a client fault;
+    # only report failure when nothing was reachable.
+    [ "$fail" -gt 0 ] && [ "$ok" -eq 0 ] && exit 1
+    exit 0
 }
 
 do_update() {
-    need_root update
-    load_state
-    hdrs=$(mktemp)
-    body=$(curl -fsS -D "$hdrs" "$OMNI_URL/config" \
-        -H "X-Omni-Machine: $m_id" -H "X-Omni-Secret: $m_secret") \
-        || { rm -f "$hdrs"; die "could not fetch config from $OMNI_URL"; }
-    ver=$(awk -F': *' 'tolower($1)=="x-omni-rathole-version"{gsub(/\r/,"",$2);print $2}' "$hdrs")
-    port=$(awk -F': *' 'tolower($1)=="x-omni-port"{gsub(/\r/,"",$2);print $2}' "$hdrs")
-    nm=$(awk -F': *' 'tolower($1)=="x-omni-name"{gsub(/\r/,"",$2);print $2}' "$hdrs")
-    rm -f "$hdrs"
-    [ -n "$body" ] || die "server returned an empty config"
+    need_root update "$@"
+    labels=$(resolve_labels "${1:-}")
+    versions=""
+    last_url=""
+    for l in $labels; do
+        # Subshell would lose variables we need; load in-place per iteration.
+        load_state "$l"
+        hdrs=$(mktemp)
+        if ! body=$(curl -fsS -D "$hdrs" "$OMNI_URL/config" \
+            -H "X-Omni-Machine: $m_id" -H "X-Omni-Secret: $m_secret"); then
+            rm -f "$hdrs"
+            say "warning: proxy '$l' unreachable — skipped"
+            continue
+        fi
+        ver=$(awk -F': *' 'tolower($1)=="x-omni-rathole-version"{gsub(/\r/,"",$2);print $2}' "$hdrs")
+        port=$(awk -F': *' 'tolower($1)=="x-omni-port"{gsub(/\r/,"",$2);print $2}' "$hdrs")
+        nm=$(awk -F': *' 'tolower($1)=="x-omni-name"{gsub(/\r/,"",$2);print $2}' "$hdrs")
+        rm -f "$hdrs"
+        [ -n "$body" ] || { say "warning: proxy '$l' sent an empty config — skipped"; continue; }
 
-    umask 077
-    printf '%s\n' "$body" > "$CLIENT_TOML"
-    [ -n "$port" ] && m_port=$port
-    [ -n "$nm" ] && m_name=$nm
-    cat > "$STATE_FILE" <<EOF
-m_id='$m_id'
-m_secret='$m_secret'
-m_port='$m_port'
-m_name='${m_name:-}'
-m_url='$OMNI_URL'
-EOF
-    [ -n "$ver" ] && RATHOLE_VERSION=$ver
-    install_rathole
-    service_restart
-    say "config refreshed, rathole at v$RATHOLE_VERSION, tunnel restarted"
+        umask 077
+        printf '%s\n' "$body" > "$PROXIES_DIR/$l/client.toml"
+        [ -n "$port" ] && m_port=$port
+        [ -n "$nm" ] && m_name=$nm
+        write_state "$l"
+        if [ -n "$ver" ]; then
+            RATHOLE_VERSION=$ver
+            versions="$versions $ver"
+        fi
+        install_rathole
+        service_restart "$l"
+        say "proxy '$l': config refreshed, tunnel restarted"
+        last_url=$OMNI_URL
+    done
+    case "$versions" in
+        *" "*" "*)
+            first=${versions# }
+            first=${first%% *}
+            for v in $versions; do
+                [ "$v" = "$first" ] || say "warning: proxies pin different rathole versions ($versions ) — last one won; align the pins"
+            done
+            ;;
+    esac
     # Self-update last: install(1) replaces the file while this shell keeps
     # its own copy, so finishing the run is safe.
-    install_self || say "warning: could not refresh $SELF_BIN"
+    if [ -n "$last_url" ]; then
+        install_self "$last_url" || say "warning: could not refresh $SELF_BIN"
+    fi
 }
 
 do_uninstall() {
-    need_root uninstall
-    say "uninstalling omni (sshd is left alone) ..."
+    need_root uninstall "$@"
+    if [ -n "${1:-}" ]; then
+        l=$(resolve_labels "$1")
+        say "removing proxy '$l' (other proxies and sshd are left alone) ..."
+        service_remove "$l"
+        rm -rf "${PROXIES_DIR:?}/$l"
+        remaining=$(proxy_count)
+        if [ "$remaining" -eq 0 ]; then
+            say "that was the last proxy — run 'omni uninstall' (no label) to remove the tooling too"
+        else
+            say "done — still enrolled with: $(all_labels | tr '\n' ' ')"
+        fi
+        return 0
+    fi
+    say "uninstalling omni everywhere (sshd is left alone) ..."
+    for l in $(all_labels); do
+        service_remove "$l"
+    done
     case "$(os_type)" in
         linux)
             systemctl disable --now "$HB_SERVICE.timer" 2>/dev/null || true
-            systemctl disable --now "$SERVICE.service" 2>/dev/null || true
-            rm -f "/etc/systemd/system/$SERVICE.service" \
-                  "/etc/systemd/system/$HB_SERVICE.service" \
-                  "/etc/systemd/system/$HB_SERVICE.timer"
+            rm -f "$SYSTEMD_DIR/$SERVICE_PREFIX@.service" \
+                  "$SYSTEMD_DIR/$HB_SERVICE.service" \
+                  "$SYSTEMD_DIR/$HB_SERVICE.timer"
             systemctl daemon-reload
             ;;
         darwin)
             launchctl bootout system/com.omni.heartbeat 2>/dev/null || true
-            launchctl bootout system/com.omni.rathole 2>/dev/null || true
-            rm -f "$MAC_RATHOLE_PLIST" "$MAC_HB_PLIST" "$MAC_LOG"
+            rm -f "$MAC_HB_PLIST"
             ;;
     esac
     rm -rf "$ETC_DIR"
     rm -f "$RATHOLE_BIN" "$SELF_BIN"
-    say "done — tell the server with: omni rm <machine> (on the VPS)"
+    say "done — tell each server with: omni rm <machine> (on the VPS)"
 }
 
 usage() {
     cat <<EOF
 omni (agent-side)
 
-enroll:    curl -fsSL <omni-url>/install.sh | sudo sh -s -- <token> [--with-herdr] [--name x]
-manage:    omni status      tunnel up? which port?
-           omni restart     bounce the tunnel service
-           omni update      re-fetch config, upgrade rathole to the server's pin
-           omni logs        tail the rathole log
-           omni uninstall   stop, remove, leave sshd alone
+enroll:    curl -fsSL <omni-url>/install.sh | sudo sh -s -- <token> [--with-herdr] [--name x] [--label x]
+           (run one proxy's one-liner per proxy; enrollments are independent)
+manage:    omni status [label]      tunnels up? which ports?
+           omni restart [label]     bounce tunnel service(s)
+           omni update [label]      re-fetch config, upgrade rathole to the pin
+           omni logs [label]        tail the rathole log(s)
+           omni uninstall [label]   remove one proxy, or everything with no label
+
+with no label, verbs act on every enrolled proxy.
 EOF
 }
 

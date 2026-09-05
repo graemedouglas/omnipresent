@@ -36,6 +36,12 @@ omni ls
 
 On an enrolled machine: `omni status | restart | update | logs | uninstall`.
 
+A machine can enroll with several independent proxies (run each proxy's
+one-liner; `--label x` names it). Each gets its own state dir under
+`/etc/omni/proxies/<label>/` and its own rathole process; verbs act on every
+proxy unless given a label, and `omni uninstall <label>` removes just that one.
+The proxies never know about each other.
+
 The Termix integration is verified against Termix-SSH/Termix main (Sept 2026):
 omni creates hosts via `POST /host/enroll` with a `tmx_…` API key minted in the
 Termix UI, and updates are read-modify-write so toggles you flip in the UI

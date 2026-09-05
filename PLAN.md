@@ -213,6 +213,14 @@ registration is the work, not the language.
 **5 — health.** Heartbeat, mark stale machines in Termix so a dead tunnel doesn't
 look like a broken connection.
 
+**6 — multi-proxy client.** One machine, several proxies — each an independent
+omni stack, because a rathole client dials exactly one remote_addr. Client-only:
+state moves to `/etc/omni/proxies/<label>/`, one rathole process and systemd
+instance per proxy, verbs act on all proxies unless given a label. Run each
+proxy's one-liner to add it; enrollments never coordinate. The server doesn't
+change — a proxy never knows the others exist, and each stays a self-contained
+recovery path.
+
 ## Decided
 
 - **rathole over frp** — per-service tokens (company and personal boxes isolated),
