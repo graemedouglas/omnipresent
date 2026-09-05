@@ -48,12 +48,25 @@ pub struct TermixCfg {
     pub stale_after_secs: i64,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HerdrCfg {
-    /// If set, `install.sh --with-herdr` pipes this URL to sh.
-    #[serde(default)]
+    /// Piped to sh by `install.sh --with-herdr`; set "" to disable the offer.
+    #[serde(default = "d_herdr_url")]
     pub install_url: String,
+}
+
+impl Default for HerdrCfg {
+    fn default() -> Self {
+        HerdrCfg {
+            install_url: d_herdr_url(),
+        }
+    }
+}
+
+fn d_herdr_url() -> String {
+    // Verified official installer (herdrdev/herdr README, Sept 2026).
+    "https://herdr.dev/install.sh".into()
 }
 
 fn d_db_path() -> String {

@@ -18,4 +18,4 @@ api_key = "tmx_CHANGE-ME"        # user-scoped API key minted in the Termix UI (
 stale_after_secs = 900                   # missed heartbeats before "(down)" in Termix
 
 [herdr]
-install_url = ""                         # if set, install.sh --with-herdr pipes it to sh
+install_url = "https://herdr.dev/install.sh"  # piped to sh by install.sh --with-herdr; blank to disable

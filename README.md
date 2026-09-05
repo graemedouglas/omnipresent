@@ -48,6 +48,17 @@ Linux x86_64 ships gnu-only, arm64 Linux is musl, a Windows msvc build exists
 for the eventual PowerShell client, and there is **no arm64 macOS build** — the
 installer falls back to the x86_64 one under Rosetta 2 and says so.
 
+The Herdr questions are answered from herdr.dev docs (Sept 2026). "Direct
+attach" is `herdr agent attach <name>` — your terminal connects to one agent's
+terminal without the full sidebar UI. PLAN.md's claim holds: direct attach is
+the one Windows-only gap, and a Windows box also can't be a `herdr --remote`
+target. But native Windows Herdr is GA (ConPTY, no WSL), and full-UI attach
+works from a PowerShell session — so the path on an enrolled Windows machine
+is: SSH in over the tunnel, run `herdr`, use the full UI; skip direct attach
+and inbound `--remote` there. The official installer omni's `--with-herdr`
+pipes is `https://herdr.dev/install.sh` (Windows twin: `install.ps1`, for
+phase 4).
+
 ## Unverified assumptions
 
 Check these before trusting them (they match PLAN.md's "verify before
@@ -55,5 +66,5 @@ building" list):
 
 - **Termix container** — env vars in `deploy/docker-compose.yml` (listen port,
   data path) follow the image docs loosely; confirm against the image.
-- Termix full-screen URL route on cold mobile open, Herdr sizing with two
-  clients attached, and the Herdr-on-Windows story — still open questions.
+- Termix full-screen URL route on cold mobile open, and Herdr pane sizing with
+  laptop and phone attached at once — still open; both need the live services.
