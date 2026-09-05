@@ -1,0 +1,4 @@
+server/target/
+*.db
+*.db-wal
+*.db-shm
