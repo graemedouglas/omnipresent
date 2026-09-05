@@ -41,14 +41,18 @@ omni creates hosts via `POST /host/enroll` with a `tmx_…` API key minted in th
 Termix UI, and updates are read-modify-write so toggles you flip in the UI
 survive a rename or sync. Details in `server/src/termix.rs`.
 
+The rathole pin is verified too: v0.5.0 is the newest release (checked Sept
+2026), the zip holds a single `rathole` binary, and `rapiz1/rathole` on GitHub
+and Docker Hub is the same project as `rathole-org` (redirect). Per-platform:
+Linux x86_64 ships gnu-only, arm64 Linux is musl, a Windows msvc build exists
+for the eventual PowerShell client, and there is **no arm64 macOS build** — the
+installer falls back to the x86_64 one under Rosetta 2 and says so.
+
 ## Unverified assumptions
 
 Check these before trusting them (they match PLAN.md's "verify before
 building" list):
 
-- **rathole releases** — the installer tries `rathole-org/rathole` then
-  `rapiz1/rathole`, musl then gnu targets, for the pinned version. Confirm the
-  pin in `omni.toml` has assets for your platforms (Windows included, later).
 - **Termix container** — env vars in `deploy/docker-compose.yml` (listen port,
   data path) follow the image docs loosely; confirm against the image.
 - Termix full-screen URL route on cold mobile open, Herdr sizing with two

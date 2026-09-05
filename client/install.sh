@@ -67,19 +67,30 @@ load_state() {
 
 # ---------------------------------------------------------------- rathole ----
 
+# Candidate release targets in preference order, verified against the
+# v0.5.0 asset list. Linux x86_64 ships gnu-only; macOS arm64 has no native
+# build at v0.5.0 and runs the x86_64 one under Rosetta 2 (the aarch64 name
+# stays first so a future release that adds it wins automatically).
 rathole_targets() {
     arch=$(uname -m)
     case "$(os_type)-$arch" in
-        linux-x86_64)               echo "x86_64-unknown-linux-musl x86_64-unknown-linux-gnu" ;;
+        linux-x86_64)               echo "x86_64-unknown-linux-gnu x86_64-unknown-linux-musl" ;;
         linux-aarch64|linux-arm64)  echo "aarch64-unknown-linux-musl" ;;
+        linux-armv7l|linux-armv6l)  echo "armv7-unknown-linux-musleabihf" ;;
         darwin-x86_64)              echo "x86_64-apple-darwin" ;;
-        darwin-arm64|darwin-aarch64) echo "aarch64-apple-darwin" ;;
+        darwin-arm64|darwin-aarch64) echo "aarch64-apple-darwin x86_64-apple-darwin" ;;
         *) die "no rathole build for $(os_type)/$arch" ;;
     esac
 }
 
+# `rathole --version` prints a multi-line build report; the version is on
+# the "Build Version:" line.
+rathole_installed_version() {
+    "$RATHOLE_BIN" --version 2>/dev/null | awk '/Build Version:/{print $3; exit}'
+}
+
 install_rathole() {
-    current=$("$RATHOLE_BIN" --version 2>/dev/null | awk '{print $2}') || current=""
+    current=$(rathole_installed_version) || current=""
     if [ "$current" = "$RATHOLE_VERSION" ]; then
         say "rathole v$RATHOLE_VERSION already installed"
         return 0
@@ -89,16 +100,20 @@ install_rathole() {
     trap 'rm -rf "$tmp"' EXIT
     found=""
     for target in $(rathole_targets); do
-        for repo in rathole-org/rathole rapiz1/rathole; do
-            url="https://github.com/$repo/releases/download/v$RATHOLE_VERSION/rathole-$target.zip"
-            if curl -fsSL -o "$tmp/rathole.zip" "$url" 2>/dev/null; then
-                found=$url
-                break 2
-            fi
-        done
+        url="https://github.com/rathole-org/rathole/releases/download/v$RATHOLE_VERSION/rathole-$target.zip"
+        if curl -fsSL -o "$tmp/rathole.zip" "$url" 2>/dev/null; then
+            found=$target
+            break
+        fi
     done
-    [ -n "$found" ] || die "could not download rathole v$RATHOLE_VERSION for $(rathole_targets)"
-    say "downloaded $found"
+    [ -n "$found" ] || die "could not download rathole v$RATHOLE_VERSION for: $(rathole_targets)"
+    say "downloaded rathole-$found.zip (v$RATHOLE_VERSION)"
+    case "$(os_type)-$(uname -m)-$found" in
+        darwin-arm64-x86_64-*|darwin-aarch64-x86_64-*)
+            say "note: no arm64 macOS build at v$RATHOLE_VERSION — using the x86_64 one via Rosetta 2"
+            say "      (if it won't start: softwareupdate --install-rosetta)"
+            ;;
+    esac
     unzip -oq "$tmp/rathole.zip" -d "$tmp"
     [ -f "$tmp/rathole" ] || die "rathole binary missing from release archive"
     install -m 0755 "$tmp/rathole" "$RATHOLE_BIN"
