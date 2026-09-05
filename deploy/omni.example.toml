@@ -13,8 +13,8 @@ remote_addr = "omni.example.tld:2333"    # what enrolled clients dial
 version = "0.5.0"                        # pin; enroll/update converge the fleet on it
 
 [termix]
-url = "http://127.0.0.1:8090"
-api_key = "CHANGE-ME"
+url = "http://127.0.0.1:8090"    # the port Termix serves its UI on; /host/* is proxied there
+api_key = "tmx_CHANGE-ME"        # user-scoped API key minted in the Termix UI (starts with tmx_)
 stale_after_secs = 900                   # missed heartbeats before "(down)" in Termix
 
 [herdr]

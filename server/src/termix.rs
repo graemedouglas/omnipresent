@@ -1,10 +1,28 @@
 //! Termix API client.
 //!
-//! NOTE: the endpoint paths and payload shape below are the one piece of omni
-//! written against an API we don't control and couldn't verify offline. Check
-//! them against your deployed Termix version (its OpenAPI/docs or the network
-//! tab while adding a host in the UI) and adjust in this one file if needed.
-//! Everything else in omni is insulated from Termix behind these functions.
+//! Verified against Termix-SSH/Termix main (September 2026),
+//! src/backend/database/routes/host.ts and docker/nginx.conf:
+//!
+//! - All paths go to the same port Termix serves its UI on; the bundled
+//!   nginx proxies `/host/` to the backend.
+//! - Auth is `Authorization: Bearer tmx_...` — a user-scoped API key minted
+//!   in the Termix UI (API keys start with `tmx_`).
+//! - `POST /host/enroll` creates a host and is the intended machine path: it
+//!   *requires* API-key auth (401 `API_KEY_REQUIRED` on a plain session) and
+//!   applies SSH defaults (connectionType=ssh, authType=none, enableTerminal,
+//!   enableSsh). Validation needs a non-empty `ip` and a valid `port`.
+//!   Returns the host object as JSON, including its numeric `id`.
+//! - `GET/PUT/DELETE /host/db/host/{id}` read, replace, and delete; all 404
+//!   when the host is gone (e.g. deleted in the UI).
+//! - A 423 `DATA_LOCKED` means the API key owner's data-encryption key isn't
+//!   unlocked server-side; they need to sign in to Termix once.
+//!
+//! PUT is a full replace, so updates here are read-modify-write: fetch the
+//! host, override only what omni owns (name, ip, port), send it back. That
+//! preserves toggles someone flipped in the UI. Sensitive fields (passwords,
+//! keys) are stripped from GET responses, so inline credentials added in the
+//! UI may not survive an update — omni-owned hosts default to authType=none,
+//! where that doesn't matter; credential *references* (credentialId) survive.
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -37,22 +55,14 @@ impl Termix {
 
     pub async fn ping(&self) -> Result<()> {
         let resp = self
-            .req(reqwest::Method::GET, "/ssh/db/host")
+            .req(reqwest::Method::GET, "/host/db/host")
             .send()
             .await
             .context("Termix unreachable")?;
         if !resp.status().is_success() {
-            bail!("Termix answered {} — check termix.url and api_key", resp.status());
+            bail!("{}", explain_status(resp.status()));
         }
         Ok(())
-    }
-
-    fn host_payload(name: &str, ip: &str, port: u16) -> serde_json::Value {
-        json!({
-            "name": name,
-            "ip": ip,
-            "port": port,
-        })
     }
 
     /// Create or update; returns the Termix host id for idempotent updates.
@@ -63,24 +73,23 @@ impl Termix {
         ip: &str,
         port: u16,
     ) -> Result<String> {
-        let payload = Self::host_payload(name, ip, port);
         if let Some(id) = existing_id {
-            let r = self
-                .req(reqwest::Method::PUT, &format!("/ssh/db/host/{id}"))
-                .json(&payload)
-                .send()
-                .await
-                .context("Termix unreachable")?;
-            if r.status().is_success() {
+            if self.update_host(id, name, ip, port).await? {
                 return Ok(id.to_string());
             }
-            // Host deleted in the UI: fall through and recreate it.
-            if r.status() != reqwest::StatusCode::NOT_FOUND {
-                bail!("Termix host update failed: {}", r.status());
-            }
+            // host deleted in the UI — recreate below
         }
+        self.create_host(name, ip, port).await
+    }
+
+    async fn create_host(&self, name: &str, ip: &str, port: u16) -> Result<String> {
+        let payload = json!({
+            "name": name,
+            "ip": ip,
+            "port": port,
+        });
         let r = self
-            .req(reqwest::Method::POST, "/ssh/db/host")
+            .req(reqwest::Method::POST, "/host/enroll")
             .json(&payload)
             .send()
             .await
@@ -88,31 +97,70 @@ impl Termix {
         let status = r.status();
         let body = r.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("Termix host create failed: {status} {}", truncate(&body));
+            bail!("Termix host create failed: {} {}", explain_status(status), truncate(&body));
         }
         let v: serde_json::Value = serde_json::from_str(&body)
             .with_context(|| format!("Termix create response is not JSON: {}", truncate(&body)))?;
-        let id = v
-            .get("id")
-            .or_else(|| v.get("hostId"))
-            .or_else(|| v.get("data").and_then(|d| d.get("id")));
-        match id {
-            Some(serde_json::Value::String(s)) => Ok(s.clone()),
+        match v.get("id") {
             Some(serde_json::Value::Number(n)) => Ok(n.to_string()),
+            Some(serde_json::Value::String(s)) => Ok(s.clone()),
             _ => bail!("Termix create response has no host id: {}", truncate(&body)),
+        }
+    }
+
+    /// Ok(false) means the host no longer exists and should be recreated.
+    async fn update_host(&self, id: &str, name: &str, ip: &str, port: u16) -> Result<bool> {
+        let r = self
+            .req(reqwest::Method::GET, &format!("/host/db/host/{id}"))
+            .send()
+            .await
+            .context("Termix unreachable")?;
+        if r.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !r.status().is_success() {
+            bail!("Termix host fetch failed: {}", explain_status(r.status()));
+        }
+        let mut host: serde_json::Value =
+            r.json().await.context("Termix host response is not JSON")?;
+        let Some(obj) = host.as_object_mut() else {
+            bail!("Termix host response is not an object");
+        };
+        obj.insert("name".into(), json!(name));
+        obj.insert("ip".into(), json!(ip));
+        obj.insert("port".into(), json!(port));
+
+        let r = self
+            .req(reqwest::Method::PUT, &format!("/host/db/host/{id}"))
+            .json(&host)
+            .send()
+            .await
+            .context("Termix unreachable")?;
+        match r.status() {
+            s if s.is_success() => Ok(true),
+            reqwest::StatusCode::NOT_FOUND => Ok(false),
+            s => bail!("Termix host update failed: {}", explain_status(s)),
         }
     }
 
     pub async fn delete_host(&self, id: &str) -> Result<()> {
         let r = self
-            .req(reqwest::Method::DELETE, &format!("/ssh/db/host/{id}"))
+            .req(reqwest::Method::DELETE, &format!("/host/db/host/{id}"))
             .send()
             .await
             .context("Termix unreachable")?;
         if !r.status().is_success() && r.status() != reqwest::StatusCode::NOT_FOUND {
-            bail!("Termix host delete failed: {}", r.status());
+            bail!("Termix host delete failed: {}", explain_status(r.status()));
         }
         Ok(())
+    }
+}
+
+fn explain_status(status: reqwest::StatusCode) -> String {
+    match status.as_u16() {
+        401 => "401 — Termix rejected the API key (needs a tmx_… key from the Termix UI)".into(),
+        423 => "423 — Termix user data is locked; sign in to Termix once as the key's owner".into(),
+        s => format!("{s}"),
     }
 }
 

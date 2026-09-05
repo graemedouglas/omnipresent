@@ -36,14 +36,16 @@ omni ls
 
 On an enrolled machine: `omni status | restart | update | logs | uninstall`.
 
+The Termix integration is verified against Termix-SSH/Termix main (Sept 2026):
+omni creates hosts via `POST /host/enroll` with a `tmx_…` API key minted in the
+Termix UI, and updates are read-modify-write so toggles you flip in the UI
+survive a rename or sync. Details in `server/src/termix.rs`.
+
 ## Unverified assumptions
 
-Built without network access to the real services; check these before trusting
-them (they match PLAN.md's "verify before building" list):
+Check these before trusting them (they match PLAN.md's "verify before
+building" list):
 
-- **Termix API** — endpoint paths and payload in `server/src/termix.rs`
-  (`/ssh/db/host`, Bearer auth) are a best guess. Verify against your Termix
-  version and adjust in that one file; everything else is insulated from it.
 - **rathole releases** — the installer tries `rathole-org/rathole` then
   `rapiz1/rathole`, musl then gnu targets, for the pinned version. Confirm the
   pin in `omni.toml` has assets for your platforms (Windows included, later).
