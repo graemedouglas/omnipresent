@@ -8,6 +8,9 @@ pub fn render_server_toml(cfg: &Config, machines: &[Machine]) -> String {
     out.push_str("# Managed by omni — hand edits are overwritten. Run `omni sync` to regenerate.\n");
     out.push_str("[server]\n");
     out.push_str(&format!("bind_addr = \"{}\"\n", cfg.rathole.bind_addr));
+    // rathole v0.5.0 rejects a config without a `services` table, so write
+    // it explicitly — with zero machines the server must still start.
+    out.push_str("\n[server.services]\n");
     for m in machines.iter().filter(|m| !m.deleted) {
         out.push_str(&format!(
             "\n# {} ({})\n[server.services.\"{}\"]\ntoken = \"{}\"\nbind_addr = \"{}:{}\"\n",
