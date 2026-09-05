@@ -1,0 +1,50 @@
+# VPS layout as code — the answer to "how do I rebuild the VPS" in eighteen
+# months. Everything omni assumes present at startup is defined here.
+#
+# Host networking on purpose: rathole binds forwarded machine ports on
+# 127.0.0.1:2201+ and Termix must reach them as loopback on the same box.
+# With bridged networks the containers wouldn't share a loopback and every
+# machine port would need publishing by hand.
+#
+# Firewall (host): allow 2333/tcp (rathole control) and 22/tcp (key-only
+# admin). Everything else closed — Termix stays loopback and is fronted by
+# cloudflared or a reverse proxy of your choosing; omni listens on loopback
+# and gets its own tunnel or proxy vhost.
+
+services:
+  rathole:
+    image: rapiz1/rathole:latest
+    command: --server /etc/rathole/server.toml
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      # omni owns and rewrites this file (the real file, not a symlink —
+      # rathole's config watcher hot-reloads it on change).
+      - /etc/rathole:/etc/rathole:ro
+
+  termix:
+    image: ghcr.io/lukegus/termix:latest
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # Keep Termix off the public interface; check the image docs for the
+      # exact listen-address / port variables of your Termix version.
+      - PORT=8090
+    volumes:
+      # Back this up. It holds every host and credential — together with
+      # omni's SQLite DB it is the fleet.
+      - termix-data:/app/data
+
+  # Optional: Cloudflare tunnel fronting Termix, Access in front of that.
+  # Buys no inbound web port and a second gate ahead of Termix's own login.
+  # Add or remove freely; nothing else depends on it.
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   command: tunnel run
+  #   network_mode: host
+  #   restart: unless-stopped
+  #   environment:
+  #     - TUNNEL_TOKEN=${CLOUDFLARED_TOKEN}
+
+volumes:
+  termix-data:

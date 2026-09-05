@@ -1,0 +1,17 @@
+# /etc/systemd/system/omni.service — the omni server on the VPS.
+#   install -m 0755 target/release/omni /usr/local/bin/omni
+#   install -m 0600 deploy/omni.example.toml /etc/omni/omni.toml   (then edit)
+#   systemctl enable --now omni
+[Unit]
+Description=omni enrollment service
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/omni serve
+Environment=OMNI_CONFIG=/etc/omni/omni.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

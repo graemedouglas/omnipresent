@@ -1,0 +1,21 @@
+# omni server config — copy to /etc/omni/omni.toml, chmod 0600 (it holds the
+# Termix API key).
+
+db_path = "/var/lib/omni/omni.db"       # back this up together with the Termix DB
+listen = "127.0.0.1:8070"               # front with cloudflared or a proxy vhost
+public_url = "https://omni.example.tld" # what enrolling machines curl; no Access policy here
+port_start = 2201                       # first forwarded machine port; counts up, never reused
+
+[rathole]
+config_path = "/etc/rathole/server.toml" # omni owns this file
+bind_addr = "0.0.0.0:2333"               # rathole control — the one public port
+remote_addr = "omni.example.tld:2333"    # what enrolled clients dial
+version = "0.5.0"                        # pin; enroll/update converge the fleet on it
+
+[termix]
+url = "http://127.0.0.1:8090"
+api_key = "CHANGE-ME"
+stale_after_secs = 900                   # missed heartbeats before "(down)" in Termix
+
+[herdr]
+install_url = ""                         # if set, install.sh --with-herdr pipes it to sh
